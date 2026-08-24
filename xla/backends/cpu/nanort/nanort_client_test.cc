@@ -30,6 +30,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/base/casts.h"
+#include "absl/base/config.h"  // IWYU pragma: keep
 #include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -70,6 +71,10 @@ limitations under the License.
 #include "xla/tsl/platform/test_benchmark.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
+
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+#include <sanitizer/msan_interface.h>
+#endif
 
 #define EIGEN_USE_THREADS
 
@@ -803,11 +808,188 @@ TEST_P(NanoRtClientTest, SharedRngGetAndUpdateStateAcrossOps) {
   }
 }
 
+TEST_P(NanoRtClientTest, MsanTracksPoisonThroughKernel) {
+#ifndef ABSL_HAVE_MEMORY_SANITIZER
+  GTEST_SKIP() << "This test requires an msan build";
+#else
+  constexpr absl::string_view kModuleStr = R"(
+    HloModule msan_shadow_test
+
+    ENTRY e {
+      p0 = f32[4] parameter(0)
+      p1 = f32[4] parameter(1)
+      ROOT sum = f32[4] add(p0, p1)
+    }
+  )";
+
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(kModuleStr));
+  XlaComputation computation(module->ToProto());
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
+                       GetExecutable(computation, GetParam()));
+
+  alignas(cpu::MinAlign()) float p0[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+  // Unlike __msan_poison, __msan_allocated_memory also sets the origin.
+  __msan_allocated_memory(&p0[2], 2 * sizeof(float));
+
+  alignas(cpu::MinAlign()) float p1[4] = {10.0f, 20.0f, 30.0f, 40.0f};
+  alignas(cpu::MinAlign()) float result[4] = {};
+  // Poison the result without an origin, so that the checks below fail unless
+  // the kernel writes the shadow of every element, and the origin of the
+  // poisoned ones.
+  __msan_poison(result, sizeof(result));
+
+  Arguments arguments = {{p0, 4}, {p1, 4}};
+  Results results = {{result, 4}};
+
+  auto event = executable->Execute(arguments, results, {});
+  tsl::BlockUntilReady(event);
+  ASSERT_TRUE(event.IsConcrete());
+
+  EXPECT_EQ(__msan_test_shadow(&result[0], 2 * sizeof(float)), -1)
+      << "result[0..1] should be initialized";
+  EXPECT_EQ(result[0], 11.0f);
+  EXPECT_EQ(result[1], 22.0f);
+
+  EXPECT_EQ(__msan_test_shadow(&result[2], sizeof(float)), 0)
+      << "result[2] should be poisoned";
+  EXPECT_EQ(__msan_test_shadow(&result[3], sizeof(float)), 0)
+      << "result[3] should be poisoned";
+
+  if (__msan_get_track_origins() > 0) {
+    EXPECT_NE(__msan_get_origin(&result[2]), 0u);
+    EXPECT_NE(__msan_get_origin(&result[3]), 0u);
+  }
+#endif
+}
+
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+// Returns which elements of `arg` are poisoned.
+static absl::Status FindPoison(
+    ffi::BufferR1<PrimitiveType::F32> arg,
+    ffi::Result<ffi::BufferR1<PrimitiveType::PRED>> poisoned) {
+  for (size_t i = 0; i < arg.element_count(); ++i) {
+    poisoned->typed_data()[i] =
+        __msan_test_shadow(&arg.typed_data()[i], sizeof(float)) != -1;
+  }
+  return absl::OkStatus();
+}
+
+XLA_FFI_DEFINE_HANDLER(kFindPoison, FindPoison,
+                       ffi::Ffi::Bind()
+                           .Arg<ffi::BufferR1<PrimitiveType::F32>>()
+                           .Ret<ffi::BufferR1<PrimitiveType::PRED>>());
+
+XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "__xla_nanort_test$$find_poison",
+                         "Host", kFindPoison);
+#endif  // ABSL_HAVE_MEMORY_SANITIZER
+
+// The custom call reads the temp buffer written by the kernel.
+TEST_P(NanoRtClientTest, MsanTracksPoisonThroughTempBuffer) {
+#ifndef ABSL_HAVE_MEMORY_SANITIZER
+  GTEST_SKIP() << "This test requires an msan build";
+#else
+  constexpr absl::string_view kModuleStr = R"(
+    HloModule msan_temp_test
+
+    ENTRY e {
+      p0 = f32[4] parameter(0)
+      p1 = f32[4] parameter(1)
+      sum = f32[4] add(p0, p1)
+      ROOT poisoned = pred[4] custom-call(sum),
+        custom_call_target="__xla_nanort_test$$find_poison",
+        api_version=API_VERSION_TYPED_FFI
+    }
+  )";
+
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(kModuleStr));
+  XlaComputation computation(module->ToProto());
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
+                       GetExecutable(computation, GetParam()));
+  ASSERT_GT(executable->temp_buffer_size(), 0);
+
+  alignas(cpu::MinAlign()) float p0[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+  __msan_poison(&p0[2], 2 * sizeof(float));
+  alignas(cpu::MinAlign()) float p1[4] = {10.0f, 20.0f, 30.0f, 40.0f};
+  alignas(cpu::MinAlign()) bool poisoned[4] = {};
+
+  Arguments arguments = {{p0, 4}, {p1, 4}};
+  Results results = {{poisoned, 4}};
+  NanoRtExecutable::ManagedTemp<64> temp(executable->temp_buffer_size());
+
+  auto event = executable->Execute(arguments, results, temp);
+  tsl::BlockUntilReady(event);
+  ASSERT_TRUE(event.IsConcrete()) << event.GetError();
+
+  EXPECT_FALSE(poisoned[0]);
+  EXPECT_FALSE(poisoned[1]);
+  EXPECT_TRUE(poisoned[2]);
+  EXPECT_TRUE(poisoned[3]);
+#endif
+}
+
 INSTANTIATE_TEST_SUITE_P(NanoRtClientTestSuite, NanoRtClientTest,
                          ::testing::Bool(),
                          [](const ::testing::TestParamInfo<bool>& info) {
                            return info.param ? "EXPORT" : "NO_EXPORT";
                          });
+
+// Like a C++ comparator under msan, a jit-compiled comparator checks that its
+// result is initialized.
+TEST(NanoRtClientDeathTest, MsanReportsSortOfPoison) {
+#ifndef ABSL_HAVE_MEMORY_SANITIZER
+  GTEST_SKIP() << "This test requires an msan build";
+#else
+  // Comparing absolute values keeps SortThunk from using a builtin comparator.
+  constexpr absl::string_view kModuleStr = R"(
+    HloModule msan_sort_test
+
+    compare {
+      lhs = f32[] parameter(0)
+      rhs = f32[] parameter(1)
+      lhs_abs = f32[] abs(lhs)
+      rhs_abs = f32[] abs(rhs)
+      ROOT lt = pred[] compare(lhs_abs, rhs_abs), direction=LT
+    }
+
+    ENTRY e {
+      p0 = f32[4] parameter(0)
+      ROOT sorted = f32[4] sort(p0), dimensions={0}, to_apply=compare
+    }
+  )";
+
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(kModuleStr));
+  XlaComputation computation(module->ToProto());
+
+  for (bool export_executable : {false, true}) {
+    SCOPED_TRACE(export_executable ? "EXPORT" : "NO_EXPORT");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
+                         GetExecutable(computation, export_executable));
+
+    alignas(cpu::MinAlign()) float p0[4] = {4.0f, -3.0f, 2.0f, -1.0f};
+    alignas(cpu::MinAlign()) float result[4] = {};
+    Arguments arguments = {{p0, 4}};
+    Results results = {{result, 4}};
+
+    auto event = executable->Execute(arguments, results, {});
+    tsl::BlockUntilReady(event);
+    ASSERT_TRUE(event.IsConcrete());
+    EXPECT_EQ(result[0], -1.0f);
+    EXPECT_EQ(result[1], 2.0f);
+    EXPECT_EQ(result[2], -3.0f);
+    EXPECT_EQ(result[3], 4.0f);
+
+    __msan_poison(&p0[1], sizeof(float));
+    EXPECT_DEATH(
+        {
+          auto poisoned_event = executable->Execute(arguments, results, {});
+          tsl::BlockUntilReady(poisoned_event);
+        },
+        "use-of-uninitialized-value");
+  }
+#endif
+}
 
 //===----------------------------------------------------------------------===//
 // Performance benchmarks below
