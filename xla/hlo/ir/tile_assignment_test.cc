@@ -37,11 +37,13 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/array.h"
 #include "xla/array2d.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace {
 
 using ::absl_testing::IsOk;
+using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::ElementsAre;
 using ::testing::HasSubstr;
@@ -669,6 +671,57 @@ TEST(TileAssignmentTest, ExtractCommonFactorSequenceRejectsZero) {
   EXPECT_THAT(GetOrderedSubDims({0, 2}, {0}, {0}),
               StatusIs(absl::StatusCode::kInvalidArgument));
 }
+
+TEST(IotaTileAssignmentTest, TryCreateFromIotaTransform) {
+  auto make_transform = [](absl::Span<const int64_t> reshape_dims,
+                           absl::Span<const int64_t> transpose_perm) {
+    MeshProto::IotaTransform transform;
+    for (int64_t dim : reshape_dims) {
+      transform.add_reshape_dims(dim);
+    }
+    for (int64_t perm : transpose_perm) {
+      transform.add_transpose_perm(perm);
+    }
+    return transform;
+  };
+
+  EXPECT_THAT(
+      IotaTileAssignment::TryCreate({2, 2}, make_transform({2, 2}, {1, 0})),
+      IsOkAndHolds(IotaTileAssignment::Create({2, 2}, {2, 2}, {1, 0})));
+  EXPECT_THAT(
+      IotaTileAssignment::TryCreate({2, 2}, make_transform({2, 3}, {1, 0})),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("must match expected")));
+  // The size mismatch is reported before the out-of-range entry.
+  EXPECT_THAT(
+      IotaTileAssignment::TryCreate({2, 2}, make_transform({2, 2}, {1})),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("must match transpose_perm size")));
+}
+
+class IotaTransformInvalidPermTest
+    : public ::testing::TestWithParam<std::vector<int64_t>> {};
+
+TEST_P(IotaTransformInvalidPermTest, TryCreateRejectsOutOfRangeEntries) {
+  MeshProto::IotaTransform transform;
+  transform.add_reshape_dims(2);
+  transform.add_reshape_dims(2);
+  for (int64_t perm : GetParam()) {
+    transform.add_transpose_perm(perm);
+  }
+  EXPECT_THAT(
+      IotaTileAssignment::TryCreate({2, 2}, transform),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("out of range")));
+}
+
+// The low 32 bits of these entries form valid permutations.
+INSTANTIATE_TEST_SUITE_P(
+    LowBitsFormPermutation, IotaTransformInvalidPermTest,
+    ::testing::Values(
+        std::vector<int64_t>{4294967297, 4294967296},
+        std::vector<int64_t>{-4294967296, 1},
+        std::vector<int64_t>{std::numeric_limits<int64_t>::max(), 0},
+        std::vector<int64_t>{std::numeric_limits<int64_t>::min(), 0}));
 
 }  // namespace
 }  // namespace xla

@@ -26,6 +26,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "google/protobuf/repeated_ptr_field.h"
 #include "tsl/platform/protobuf.h"
@@ -96,8 +97,9 @@ class CollectiveDeviceListBase {
     return ToString();
   }
 
-  static std::unique_ptr<CollectiveDeviceListBase> DeviceListFromProto(
-      const HloInstructionProto& proto);
+  // Returns an error if the collective device list in `proto` is invalid.
+  static absl::StatusOr<std::unique_ptr<CollectiveDeviceListBase>>
+  DeviceListFromProto(const HloInstructionProto& proto);
 
   virtual std::unique_ptr<CollectiveDeviceListBase> Clone() const = 0;
   virtual CollectiveDeviceListVersion version() const = 0;
@@ -114,6 +116,11 @@ class CollectiveDeviceListBase {
 class MeshAxesReplicaGroupList : public CollectiveDeviceListBase {
  public:
   explicit MeshAxesReplicaGroupList(Mesh mesh, std::vector<AxisRef> axes);
+
+  // Same as the constructor above, but returns an error instead of crashing if
+  // `axes` are invalid for `mesh`.
+  static absl::StatusOr<MeshAxesReplicaGroupList> TryCreate(
+      Mesh mesh, std::vector<AxisRef> axes);
 
   bool operator==(const MeshAxesReplicaGroupList& other) const {
     return mesh_ == other.mesh_ && axes_ == other.axes_;
@@ -148,7 +155,8 @@ class MeshAxesReplicaGroupList : public CollectiveDeviceListBase {
   }
 
   // Conversion and Serialization
-  static MeshAxesReplicaGroupList FromProto(
+  // Returns an error if `proto` is invalid.
+  static absl::StatusOr<MeshAxesReplicaGroupList> FromProto(
       const MeshAxesReplicaGroupListProto& proto);
   IotaReplicaGroupList ToIotaReplicaGroupList() const;
   std::unique_ptr<CollectiveDeviceList> ToCollectiveDeviceList() const;
@@ -159,6 +167,9 @@ class MeshAxesReplicaGroupList : public CollectiveDeviceListBase {
   }
 
  private:
+  // Constructs an empty list for `TryCreate` to populate.
+  MeshAxesReplicaGroupList() = default;
+
   struct ReshapeAndAggregateAxes {
     std::vector<int64_t> reshape_dims;
     std::vector<int64_t> aggregate_axes;
@@ -201,6 +212,13 @@ class IotaReplicaGroupList : public CollectiveDeviceListBase {
         num_replica_groups_(num_replica_groups),
         num_devices_per_group_(num_devices_per_group) {}
 
+  // Same as the constructor taking `reshape_dims` and `transpose_perm`, but
+  // returns an error instead of crashing if the arguments are invalid.
+  static absl::StatusOr<IotaReplicaGroupList> TryCreate(
+      int64_t num_replica_groups, int64_t num_devices_per_group,
+      absl::Span<const int64_t> reshape_dims,
+      absl::Span<const int> transpose_perm);
+
   bool operator==(const IotaReplicaGroupList& other) const {
     return num_replica_groups() == other.num_replica_groups() &&
            num_devices_per_group() == other.num_devices_per_group() &&
@@ -239,7 +257,9 @@ class IotaReplicaGroupList : public CollectiveDeviceListBase {
   }
 
   IotaReplicaGroupListProto ToProto() const;
-  static IotaReplicaGroupList FromProto(const IotaReplicaGroupListProto& proto);
+  // Returns an error if `proto` is invalid.
+  static absl::StatusOr<IotaReplicaGroupList> FromProto(
+      const IotaReplicaGroupListProto& proto);
 
  protected:
   bool isEqual(const CollectiveDeviceListBase& other) const override {
@@ -346,7 +366,9 @@ class CollectiveDeviceList : public CollectiveDeviceListBase {
 
   CollectiveDeviceListProto ToProto() const;
   static CollectiveDeviceList FromProto(const CollectiveDeviceListProto& proto);
-  static CollectiveDeviceList FromProto(const HloInstructionProto& proto);
+  // Returns an error if the collective device list in `proto` is invalid.
+  static absl::StatusOr<CollectiveDeviceList> FromProto(
+      const HloInstructionProto& proto);
 
   std::unique_ptr<CollectiveDeviceListBase> Clone() const override {
     return std::make_unique<CollectiveDeviceList>(*this);

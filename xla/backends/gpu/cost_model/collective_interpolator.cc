@@ -31,6 +31,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
@@ -192,10 +193,14 @@ std::unique_ptr<HloModule> AllReduceModule(
   wrapped_computation.AddInstruction(
       HloInstruction::CreateBinary(s, HloOpcode::kAdd, a, b));
 
-  CollectiveDeviceList collective_device_list(
-      IotaReplicaGroupList::FromProto(
-          profile.instruction().iota_collective_device_list())
-          .flattened_replica_groups());
+  absl::StatusOr<IotaReplicaGroupList> iota = IotaReplicaGroupList::FromProto(
+      profile.instruction().iota_collective_device_list());
+  if (!iota.ok()) {
+    VLOG(1) << "Cannot parse iota collective device list: " << iota.status()
+            << " " << profile.DebugString();
+    return nullptr;
+  }
+  CollectiveDeviceList collective_device_list(iota->flattened_replica_groups());
 
   HloComputation* subcomp =
       module->AddEmbeddedComputation(wrapped_computation.Build());
@@ -234,10 +239,14 @@ std::unique_ptr<HloModule> ReduceScatterModule(
   wrapped_computation.AddInstruction(
       HloInstruction::CreateBinary(s, HloOpcode::kAdd, a, b));
 
-  CollectiveDeviceList collective_device_list(
-      IotaReplicaGroupList::FromProto(
-          profile.instruction().iota_collective_device_list())
-          .flattened_replica_groups());
+  absl::StatusOr<IotaReplicaGroupList> iota = IotaReplicaGroupList::FromProto(
+      profile.instruction().iota_collective_device_list());
+  if (!iota.ok()) {
+    VLOG(1) << "Cannot parse iota collective device list: " << iota.status()
+            << " " << profile.DebugString();
+    return nullptr;
+  }
+  CollectiveDeviceList collective_device_list(iota->flattened_replica_groups());
 
   HloComputation* subcomp =
       module->AddEmbeddedComputation(wrapped_computation.Build());
@@ -281,10 +290,14 @@ std::unique_ptr<HloModule> AllGatherModule(
 
   HloComputation::Builder entry_builder("entry");
 
-  CollectiveDeviceList collective_device_list(
-      IotaReplicaGroupList::FromProto(
-          profile.instruction().iota_collective_device_list())
-          .flattened_replica_groups());
+  absl::StatusOr<IotaReplicaGroupList> iota = IotaReplicaGroupList::FromProto(
+      profile.instruction().iota_collective_device_list());
+  if (!iota.ok()) {
+    VLOG(1) << "Cannot parse iota collective device list: " << iota.status()
+            << " " << profile.DebugString();
+    return nullptr;
+  }
+  CollectiveDeviceList collective_device_list(iota->flattened_replica_groups());
 
   if (shape->dimensions().size() != 1) {
     VLOG(1) << "Unsupported number of dimensions: " << profile.DebugString();
@@ -324,10 +337,14 @@ std::unique_ptr<HloModule> AllToAllModule(
   }
 
   HloComputation::Builder entry_builder("entry");
-  CollectiveDeviceList collective_device_list(
-      IotaReplicaGroupList::FromProto(
-          profile.instruction().iota_collective_device_list())
-          .flattened_replica_groups());
+  absl::StatusOr<IotaReplicaGroupList> iota = IotaReplicaGroupList::FromProto(
+      profile.instruction().iota_collective_device_list());
+  if (!iota.ok()) {
+    VLOG(1) << "Cannot parse iota collective device list: " << iota.status()
+            << " " << profile.DebugString();
+    return nullptr;
+  }
+  CollectiveDeviceList collective_device_list(iota->flattened_replica_groups());
 
   HloInstruction* p0 = entry_builder.AddInstruction(
       HloInstruction::CreateParameter(0, *shape, "p0"));
