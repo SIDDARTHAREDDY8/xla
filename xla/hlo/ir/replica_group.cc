@@ -30,6 +30,7 @@ limitations under the License.
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/types/span.h"
@@ -441,7 +442,9 @@ MeshAxesReplicaGroupList MeshAxesReplicaGroupList::CanonicalizeWithoutSubaxes()
   TileAssignment new_device_assignment =
       mesh_.device_assignment().Reshape(reindex_axis_sizes);
 
-  Mesh new_mesh(new_device_assignment, new_axes_names_views);
+  absl::StatusOr<Mesh> new_mesh =
+      Mesh::TryCreate(std::move(new_device_assignment), new_axes_names_views);
+  CHECK_OK(new_mesh);
 
   std::vector<AxisRef> new_axes;
   new_axes.reserve(reindexed_grouped_axes.size());
@@ -449,7 +452,7 @@ MeshAxesReplicaGroupList MeshAxesReplicaGroupList::CanonicalizeWithoutSubaxes()
     new_axes.push_back(AxisRef(idx));
   }
 
-  return MeshAxesReplicaGroupList(new_mesh, new_axes);
+  return MeshAxesReplicaGroupList(*std::move(new_mesh), std::move(new_axes));
 }
 
 MeshAxesReplicaGroupListProto MeshAxesReplicaGroupList::ToProto() const {
@@ -463,12 +466,17 @@ MeshAxesReplicaGroupListProto MeshAxesReplicaGroupList::ToProto() const {
 
 MeshAxesReplicaGroupList MeshAxesReplicaGroupList::FromProto(
     const MeshAxesReplicaGroupListProto& proto) {
-  Mesh mesh = Mesh::FromProto(proto.mesh());
+  // TODO(b/584413505): Propagate errors once
+  // MeshAxesReplicaGroupList::FromProto returns StatusOr.
+  absl::StatusOr<Mesh> mesh = Mesh::FromProto(proto.mesh());
+  CHECK_OK(mesh);
   std::vector<AxisRef> axes;
   for (const AxisRefProto& axis_proto : proto.axes()) {
-    axes.push_back(AxisRef::FromProto(axis_proto));
+    absl::StatusOr<AxisRef> axis = AxisRef::FromProto(axis_proto);
+    CHECK_OK(axis);
+    axes.push_back(*axis);
   }
-  return MeshAxesReplicaGroupList(mesh, axes);
+  return MeshAxesReplicaGroupList(*std::move(mesh), axes);
 }
 
 IotaReplicaGroupList MeshAxesReplicaGroupList::ToIotaReplicaGroupList() const {

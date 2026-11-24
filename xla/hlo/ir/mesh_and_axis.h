@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/array.h"
@@ -75,8 +76,11 @@ class Mesh {
                  std::move(device_assignment))),
              axes_names) {}
 
-  explicit Mesh(TileAssignment device_assignment,
-                absl::Span<const absl::string_view> axes_names);
+  // Constructs a mesh with the given `device_assignment` and `axes_names`,
+  // returning an error if the mesh is invalid.
+  static absl::StatusOr<Mesh> TryCreate(
+      TileAssignment device_assignment,
+      absl::Span<const absl::string_view> axes_names);
 
   // Returns whether this mesh is a single-device mesh.
   //
@@ -100,7 +104,8 @@ class Mesh {
 
   MeshProto ToProto() const;
 
-  static Mesh FromProto(const MeshProto& proto);
+  // Returns an error if `proto` does not describe a valid mesh.
+  static absl::StatusOr<Mesh> FromProto(const MeshProto& proto);
 
   const TileAssignment& device_assignment() const { return device_assignment_; }
   absl::Span<const std::string> axis_names() const { return axes_names_; }
@@ -117,6 +122,9 @@ class Mesh {
   bool ContainsAllMeshAxesInOrder(absl::Span<const AxisRef> axes) const;
 
  private:
+  explicit Mesh(TileAssignment device_assignment,
+                absl::Span<const absl::string_view> axes_names);
+
   absl::Status Validate();
   // Dimensions of the `device_assignment_` array correspond to the axes of the
   // mesh.
@@ -198,7 +206,9 @@ class AxisRef {
 
   AxisRefProto ToProto() const;
 
-  static AxisRef FromProto(const AxisRefProto& proto);
+  // Returns an error if `proto` has a negative mesh axis index or an invalid
+  // sub-axis. The mesh axis index is not checked against a mesh.
+  static absl::StatusOr<AxisRef> FromProto(const AxisRefProto& proto);
 
   bool CanCoexistWithoutOverlap(const AxisRef& other) const;
 

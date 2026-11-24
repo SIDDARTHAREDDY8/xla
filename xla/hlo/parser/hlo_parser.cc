@@ -4440,15 +4440,17 @@ bool HloParserImpl::ParseMesh(std::optional<Mesh>& mesh) {
           !ParseToken(TokKind::kRparen, "expected ')' to end device_ids")) {
         return false;
       }
-      if (Product(axis_sizes) != Product(iota_reshape_dims)) {
-        return TokenError(absl::StrCat(
-            "mesh device_ids iota size ", Product(iota_reshape_dims),
-            " does not match the product of the mesh axis sizes ",
-            Product(axis_sizes)));
+      absl::StatusOr<IotaTileAssignment> iota = IotaTileAssignment::TryCreate(
+          axis_sizes, iota_reshape_dims, iota_transpose_perm);
+      if (!iota.ok()) {
+        return TokenError(iota.status().message());
       }
-      mesh.emplace(
-          TileAssignment(axis_sizes, iota_reshape_dims, iota_transpose_perm),
-          axis_names_views);
+      absl::StatusOr<Mesh> parsed_mesh =
+          Mesh::TryCreate(TileAssignment(*std::move(iota)), axis_names_views);
+      if (!parsed_mesh.ok()) {
+        return TokenError(parsed_mesh.status().message());
+      }
+      mesh = *std::move(parsed_mesh);
       return true;
     }
 
@@ -4486,14 +4488,29 @@ bool HloParserImpl::ParseMesh(std::optional<Mesh>& mesh) {
           "Expected %d device_ids based on mesh axes, but got %d", num_elements,
           devices.size()));
     }
-    Array<int64_t> device_ids_array(axis_sizes);
-    absl::c_copy(devices, device_ids_array.begin());
-    mesh.emplace(device_ids_array, axis_names_views);
+    auto device_ids_array = std::make_shared<Array<int64_t>>(axis_sizes);
+    absl::c_copy(devices, device_ids_array->begin());
+    absl::StatusOr<Mesh> parsed_mesh = Mesh::TryCreate(
+        TileAssignment(std::move(device_ids_array)), axis_names_views);
+    if (!parsed_mesh.ok()) {
+      return TokenError(parsed_mesh.status().message());
+    }
+    mesh = *std::move(parsed_mesh);
     return true;
   }
 
   // Simple iota case
-  mesh.emplace(axis_sizes, axis_names_views);
+  absl::StatusOr<IotaTileAssignment> iota =
+      IotaTileAssignment::TryCreate(axis_sizes);
+  if (!iota.ok()) {
+    return TokenError(iota.status().message());
+  }
+  absl::StatusOr<Mesh> parsed_mesh =
+      Mesh::TryCreate(TileAssignment(*std::move(iota)), axis_names_views);
+  if (!parsed_mesh.ok()) {
+    return TokenError(parsed_mesh.status().message());
+  }
+  mesh = *std::move(parsed_mesh);
   return true;
 }
 
