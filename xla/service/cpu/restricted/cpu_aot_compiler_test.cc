@@ -478,6 +478,27 @@ TEST_F(CpuAotLoadExecutableTest, EmbedsFullHloProtoWhenDumpingSnapshots) {
   EXPECT_TRUE(found_payload);
 }
 
+// CompileAheadOfTime initializes the LLVM targets itself, so callers can
+// cross-compile without initializing them first.
+TEST_F(CpuAotCompilerTest, CrossCompiles) {
+  constexpr absl::string_view kHlo = R"(
+HloModule module
+
+ENTRY main {
+  p0 = f32[64] parameter(0)
+  ROOT add = f32[64] add(p0, p0)
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  CpuAotCompilationOptions aot_options(
+      llvm::Triple(kTargetTripleForHost).isX86() ? "aarch64-unknown-linux-gnu"
+                                                 : "x86_64-unknown-linux-gnu",
+      /*cpu_name=*/"", /*features=*/"", /*entry_point_name=*/"entry",
+      CpuAotCompilationOptions::RelocationModel::BigPic);
+  EXPECT_OK(
+      backend().compiler()->CompileAheadOfTime(std::move(module), aot_options));
+}
+
 }  // namespace
 }  // namespace cpu
 }  // namespace xla
