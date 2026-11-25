@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
 load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm")
 load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl")
@@ -322,10 +323,10 @@ cc_library(
         "@tsl//tsl/profiler/lib:traceme",
     ] + if_cuda_or_rocm([
         # keep sorted
+        "//xla/backends/gpu:gpu_compiler",
         "//xla/backends/gpu/runtime:gpu_executable",
         "//xla/backends/gpu/runtime:gpu_executable_buffer_allocator",
         "//xla/backends/gpu/runtime:thunk_executor",
-        "//xla/service/gpu:gpu_compiler",
         "//xla/service/gpu:stream_executor_util",
     ]) + if_cuda([
         # keep sorted
@@ -334,10 +335,10 @@ cc_library(
         "@local_config_cuda//cuda:cuda_headers",
     ]) + if_sycl([
         # keep sorted
+        "//xla/backends/gpu:gpu_compiler",
         "//xla/backends/gpu/runtime:gpu_executable",
         "//xla/backends/gpu/runtime:gpu_executable_buffer_allocator",
         "//xla/backends/gpu/runtime:thunk_executor",
-        "//xla/service/gpu:gpu_compiler",
         "//xla/service/gpu:stream_executor_util",
         "@local_config_sycl//sycl:sycl_headers",
     ]),
@@ -913,7 +914,7 @@ cc_library(
         "//xla/stream_executor/platform:initialize",
         "@com_google_absl//absl/log:check",
     ] + if_cuda([
-        "//xla/service/gpu:nvptx_compiler",  # buildcleaner: keep
+        "//xla/backends/gpu:nvptx_compiler",  # buildcleaner: keep
     ]),
     alwayslink = 1,
 )
@@ -928,9 +929,9 @@ cc_library(
     ],
     deps = [
         ":se_gpu_pjrt_compiler_impl",
+        "//xla/backends/gpu:amdgpu_compiler",  # buildcleaner: keep
         "//xla/pjrt:pjrt_compiler",
         "//xla/pjrt/se:stream_executor_platform_id_mapping",
-        "//xla/service/gpu:amdgpu_compiler",  # buildcleaner: keep
         "//xla/stream_executor/platform:initialize",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "@com_google_absl//absl/log:check",
@@ -953,9 +954,9 @@ cc_library(
     ]),
     deps = [
         ":se_gpu_pjrt_compiler_impl",
+        "//xla/backends/gpu:intel_gpu_compiler",
         "//xla/pjrt:pjrt_compiler",
         "//xla/pjrt/se:stream_executor_platform_id_mapping",
-        "//xla/service/gpu:intel_gpu_compiler",
         "//xla/stream_executor/platform:initialize",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "@com_google_absl//absl/log:check",
@@ -1277,4 +1278,10 @@ memfile_embed_data(
     srcs = [":gpu_pjrt_client_hash"],
     embedded_dir_name = "gpu_pjrt_client_hash",
     visibility = internal_visibility([":gpu_pjrt_client_hash_users"]),
+)
+
+bzl_library(
+    name = "package_groups_bzl",
+    srcs = ["package_groups.bzl"],
+    visibility = ["//visibility:private"],
 )

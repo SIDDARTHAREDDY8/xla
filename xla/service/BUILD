@@ -1,10 +1,12 @@
 # Description:
 #   XLA service implementation.
 
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
 load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm", "if_rocm_is_configured")
 load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl", "if_sycl_is_configured")
+load("@xla//third_party/rules_python/python:py_library.bzl", "py_library")
 load(
     "//xla:xla.default.bzl",
     "xla_cc_binary",
@@ -1073,16 +1075,16 @@ cc_library(
     deps = [
     ] + if_gpu_is_configured([
         ":service",
-        "//xla/service/gpu:gpu_compiler",
+        "//xla/backends/gpu:gpu_compiler",
         "//xla/service/gpu:gpu_transfer_manager",
     ]) + if_cuda_is_configured([
-        "//xla/service/gpu:nvptx_compiler",
+        "//xla/backends/gpu:nvptx_compiler",
         "//xla/stream_executor/cuda:stream_executor_cuda",
     ]) + if_rocm_is_configured([
-        "//xla/service/gpu:amdgpu_compiler",
+        "//xla/backends/gpu:amdgpu_compiler",
         "//xla/stream_executor/rocm:stream_executor_rocm",
     ]) + if_sycl_is_configured([
-        "//xla/service/gpu:intel_gpu_compiler",
+        "//xla/backends/gpu:intel_gpu_compiler",
     ]),
 )
 
@@ -3918,18 +3920,18 @@ xla_cc_binary(
     ] + if_cuda_or_rocm_is_configured([
         # keep sorted
         ":gpu_plugin",
-        "//xla/service/gpu:gpu_compiler",
+        "//xla/backends/gpu:gpu_compiler",
         "//xla/stream_executor/gpu:gpu_init",
     ]) + if_cuda_is_configured([
         # keep sorted
-        "//xla/service/gpu:nvptx_compiler",
-        "//xla/service/gpu:nvptx_compiler_impl",
+        "//xla/backends/gpu:nvptx_compiler",
+        "//xla/backends/gpu:nvptx_compiler_impl",
         "//xla/stream_executor/cuda:all_runtime",
         "//xla/stream_executor/cuda:cuda_platform",
     ]) + if_rocm_is_configured([
         # keep sorted
-        "//xla/service/gpu:amdgpu_compiler",
-        "//xla/service/gpu:amdgpu_compiler_impl",
+        "//xla/backends/gpu:amdgpu_compiler",
+        "//xla/backends/gpu:amdgpu_compiler_impl",
         "//xla/stream_executor/rocm:all_runtime",
         "//xla/stream_executor/rocm:rocm_platform",
     ]) + xla_internal(["tools:xsymbol_repository"]) + if_google([
@@ -4700,4 +4702,21 @@ xla_cc_test(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],
+)
+
+bzl_library(
+    name = "xla_compile_bzl",
+    srcs = ["xla_compile.bzl"],
+    visibility = ["//visibility:private"],
+    deps = [
+        "//xla:xla_bzl",
+        "//xla/tsl/platform/default:cuda_build_defs_bzl",
+    ],
+)
+
+py_library(
+    name = "algebraic_simplifier_proof_distributive_property",
+    srcs = ["algebraic_simplifier_proof_distributive_property.py"],
+    type_checking = True,
+    deps = ["//third_party/py/z3"],
 )
