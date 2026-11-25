@@ -4455,6 +4455,7 @@ cc_library(
         ":__subpackages__",
         "//xla/tools:__subpackages__",
         "//xla/backends/gpu:__subpackages__",
+        "//xla/python:__pkg__",
     ]),
     deps = [
         ":gpu_topology_proto_cc",
