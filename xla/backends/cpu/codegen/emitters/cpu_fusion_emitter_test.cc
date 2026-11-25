@@ -17,8 +17,12 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
+#include <ios>
 #include <memory>
 #include <string>
 #include <utility>
@@ -26,17 +30,18 @@ limitations under the License.
 
 #include "absl/base/attributes.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Argument.h"
+#include "llvm/IR/FMF.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CodeGen.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
@@ -1647,6 +1652,303 @@ TEST_F(CpuFusionEmitterTest,
                                    args.data()};
   EXPECT_EQ(CallCpuKernel(kernel, &frame), nullptr);
   EXPECT_EQ(dst, src);
+}
+
+template <typename F8>
+absl::Status VerifyFp8ConversionsInJit(absl::string_view mlir_type,
+                                       llvm::FastMathFlags fmf,
+                                       bool check_nan_sign = true) {
+  auto make_convert_mlir = [](absl::string_view name, absl::string_view op,
+                              absl::string_view src_ty,
+                              absl::string_view dst_ty, size_t count) {
+    return absl::Substitute(R"(
+      module attributes {xla.cpu_memory_region_name = "$0"} {
+        func.func @$0(
+            %src: tensor<$4x$2> {llvm.align = 16 : index, xla.invariant, xla.slice_index = 0},
+            %dst: tensor<$4x$3> {llvm.align = 16 : index, xla.slice_index = 1})
+            -> tensor<$4x$3>
+            attributes {xla.backend_kind = #xla.backend_kind<cpu>, xla.entry} {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %cN = arith.constant $4 : index
+          %res = scf.for %i = %c0 to %cN step %c1 iter_args(%cur = %dst) -> (tensor<$4x$3>) {
+            %v = tensor.extract %src[%i] : tensor<$4x$2>
+            %f = arith.$1 %v : $2 to $3
+            %next = tensor.insert %f into %cur[%i] : tensor<$4x$3>
+            scf.yield %next : tensor<$4x$3>
+          }
+          return %res : tensor<$4x$3>
+        }
+      }
+    )",
+                            name, op, src_ty, dst_ty, count);
+  };
+
+  // Build a dense set of f32 test values covering every exponent, subnormal
+  // boundary, halfway tie, overflow, underflow, signed zero, Inf, and NaN.
+  std::vector<uint32_t> f32_bits;
+  f32_bits.reserve(256 * 256);
+  const uint32_t mant_samples[] = {
+      0x000000u, 0x000001u, 0x07FFFFu, 0x080000u, 0x080001u, 0x0FFFFFu,
+      0x100000u, 0x100001u, 0x17FFFFu, 0x180000u, 0x180001u, 0x1FFFFFu,
+      0x200000u, 0x200001u, 0x27FFFFu, 0x280000u, 0x280001u, 0x300000u,
+      0x380000u, 0x3FFFFFu, 0x400000u, 0x400001u, 0x4FFFFFu, 0x500000u,
+      0x5FFFFFu, 0x600000u, 0x600001u, 0x680000u, 0x6FFFFFu, 0x700000u,
+      0x700001u, 0x77FFFFu, 0x780000u, 0x780001u, 0x7FFFFEu, 0x7FFFFFu,
+  };
+  for (uint32_t sign : {0u, 1u}) {
+    for (uint32_t exp = 0; exp < 256; ++exp) {
+      for (uint32_t mant : mant_samples) {
+        f32_bits.push_back((sign << 31) | (exp << 23) | mant);
+      }
+    }
+  }
+  // Pad to a multiple of 32 for vectorization coverage.
+  while (f32_bits.size() % 32 != 0) {
+    f32_bits.push_back(0);
+  }
+  const size_t n_f32 = f32_bits.size();
+
+  auto compile_and_run = [&](absl::string_view mlir, absl::string_view name,
+                             void* src_ptr, size_t src_bytes, void* dst_ptr,
+                             size_t dst_bytes) -> absl::Status {
+    std::unique_ptr<mlir::MLIRContext> mlir_context =
+        FusionCompiler::CreateContext();
+    mlir::MLIRContext* context_ptr = mlir_context.get();
+    ABSL_ASSIGN_OR_RETURN(
+        MlirKernelSource mlir_source,
+        MlirKernelSource::ParseFromString(mlir, std::move(mlir_context)));
+    FusionCompiler::Options fc_opts{256, 1, false, fmf};
+    FusionCompiler compiler(context_ptr, fc_opts);
+    ABSL_ASSIGN_OR_RETURN(LlvmKernelSource llvm_source,
+                          compiler.Compile(std::move(mlir_source)));
+    std::unique_ptr<IrCompiler> ir_compiler =
+        IrCompiler::Create({},
+                           IrCompiler::Options{
+                               /*opt_level=*/llvm::CodeGenOptLevel::Aggressive,
+                               /*optimize_for_size=*/false,
+                               TargetMachineOptions(GetDebugOptionsFromFlags()),
+                               /*fast_math_flags=*/fmf,
+                           },
+                           IrCompiler::CompilationHooks());
+    ABSL_ASSIGN_OR_RETURN(JitCompiler jit,
+                          JitCompiler::Create({}, std::move(ir_compiler)));
+    ABSL_RETURN_IF_ERROR(
+        jit.AddModule(std::move(llvm_source).thread_safe_module()));
+    ABSL_ASSIGN_OR_RETURN(
+        std::unique_ptr<FunctionLibrary> library,
+        std::move(jit).Compile(
+            {FunctionLibrary::Sym<FunctionLibrary::Kernel>(name)}));
+    ABSL_ASSIGN_OR_RETURN(
+        FunctionLibrary::Kernel * kernel,
+        library->ResolveFunction<FunctionLibrary::Kernel>(name));
+    std::array<XLA_CPU_KernelArg, 2> args = {{
+        {src_ptr, src_bytes},
+        {dst_ptr, dst_bytes},
+    }};
+    XLA_CPU_NumWorkGroups num_workgroups = {1, 1, 1};
+    XLA_CPU_WorkGroupId workgroup_id = {0, 0, 0};
+    XLA_CPU_KernelCallFrame frame = {&num_workgroups, &workgroup_id,
+                                     args.size(), args.data()};
+    if (CallCpuKernel(kernel, &frame) != nullptr) {
+      return absl::InternalError(
+          absl::Substitute("CPU kernel $0 returned non-null error", name));
+    }
+    return absl::OkStatus();
+  };
+
+  // 1. Exhaustive f8 -> f32 (all 256 bit patterns).
+  alignas(64) std::array<uint8_t, 256> all_f8{};
+  for (int i = 0; i < 256; ++i) {
+    all_f8[i] = static_cast<uint8_t>(i);
+  }
+  alignas(64) std::array<float, 256> out_f32{};
+  ABSL_RETURN_IF_ERROR(compile_and_run(
+      make_convert_mlir("fp8_ext_f32", "extf", mlir_type, "f32", 256),
+      "fp8_ext_f32", all_f8.data(), sizeof(all_f8), out_f32.data(),
+      sizeof(out_f32)));
+  for (int i = 0; i < 256; ++i) {
+    F8 val;
+    std::memcpy(&val, &all_f8[i], 1);
+    float expected = static_cast<float>(val);
+    uint32_t actual_bits = 0;
+    uint32_t expected_bits = 0;
+    std::memcpy(&actual_bits, &out_f32[i], 4);
+    std::memcpy(&expected_bits, &expected, 4);
+    if (std::isnan(expected)) {
+      EXPECT_TRUE(std::isnan(out_f32[i])) << mlir_type << " idx=" << i;
+      if (check_nan_sign) {
+        EXPECT_EQ(actual_bits >> 31, expected_bits >> 31)
+            << mlir_type << " NaN sign idx=" << i;
+      } else {
+        EXPECT_EQ(actual_bits, 0x7FC00000u)
+            << mlir_type << " FNUZ qNaN idx=" << i;
+      }
+    } else {
+      EXPECT_EQ(actual_bits, expected_bits) << mlir_type << " idx=" << i;
+    }
+  }
+
+  // 2. Exhaustive f8 -> bf16 (all 256 bit patterns).
+  alignas(64) std::array<bfloat16, 256> out_bf16{};
+  ABSL_RETURN_IF_ERROR(compile_and_run(
+      make_convert_mlir("fp8_ext_bf16", "extf", mlir_type, "bf16", 256),
+      "fp8_ext_bf16", all_f8.data(), sizeof(all_f8), out_bf16.data(),
+      sizeof(out_bf16)));
+  for (int i = 0; i < 256; ++i) {
+    F8 val;
+    std::memcpy(&val, &all_f8[i], 1);
+    bfloat16 expected = static_cast<bfloat16>(static_cast<float>(val));
+    uint16_t actual_bits = 0;
+    uint16_t expected_bits = 0;
+    std::memcpy(&actual_bits, &out_bf16[i], 2);
+    std::memcpy(&expected_bits, &expected, 2);
+    if (std::isnan(static_cast<float>(expected))) {
+      EXPECT_TRUE(std::isnan(static_cast<float>(out_bf16[i])))
+          << mlir_type << " bf16 idx=" << i;
+      if (check_nan_sign) {
+        EXPECT_EQ(actual_bits >> 15, expected_bits >> 15)
+            << mlir_type << " bf16 NaN sign idx=" << i;
+      } else {
+        EXPECT_EQ(actual_bits, 0x7FC0u)
+            << mlir_type << " FNUZ bf16 qNaN idx=" << i;
+      }
+    } else {
+      EXPECT_EQ(actual_bits, expected_bits) << mlir_type << " bf16 idx=" << i;
+    }
+  }
+
+  // 3. Exhaustive f8 -> f16 (all 256 bit patterns, including e5m2 fast path).
+  alignas(64) std::array<half, 256> out_f16{};
+  ABSL_RETURN_IF_ERROR(compile_and_run(
+      make_convert_mlir("fp8_ext_f16", "extf", mlir_type, "f16", 256),
+      "fp8_ext_f16", all_f8.data(), sizeof(all_f8), out_f16.data(),
+      sizeof(out_f16)));
+  for (int i = 0; i < 256; ++i) {
+    F8 val;
+    std::memcpy(&val, &all_f8[i], 1);
+    half expected = static_cast<half>(val);
+    uint16_t actual_bits = 0;
+    uint16_t expected_bits = 0;
+    std::memcpy(&actual_bits, &out_f16[i], 2);
+    std::memcpy(&expected_bits, &expected, 2);
+    if (std::isnan(static_cast<float>(expected))) {
+      EXPECT_TRUE(std::isnan(static_cast<float>(out_f16[i])))
+          << mlir_type << " f16 idx=" << i;
+      if (check_nan_sign) {
+        EXPECT_EQ(actual_bits >> 15, expected_bits >> 15)
+            << mlir_type << " f16 NaN sign idx=" << i;
+      } else {
+        EXPECT_EQ(actual_bits, 0x7E00u)
+            << mlir_type << " FNUZ f16 qNaN idx=" << i;
+      }
+    } else {
+      EXPECT_EQ(actual_bits, expected_bits) << mlir_type << " f16 idx=" << i;
+    }
+  }
+
+  // 4. Exhaustive f8 -> f64 (all 256 bit patterns).
+  alignas(64) std::array<double, 256> out_f64{};
+  ABSL_RETURN_IF_ERROR(compile_and_run(
+      make_convert_mlir("fp8_ext_f64", "extf", mlir_type, "f64", 256),
+      "fp8_ext_f64", all_f8.data(), sizeof(all_f8), out_f64.data(),
+      sizeof(out_f64)));
+  for (int i = 0; i < 256; ++i) {
+    F8 val;
+    std::memcpy(&val, &all_f8[i], 1);
+    double expected = static_cast<double>(static_cast<float>(val));
+    uint64_t actual_bits = 0;
+    uint64_t expected_bits = 0;
+    std::memcpy(&actual_bits, &out_f64[i], 8);
+    std::memcpy(&expected_bits, &expected, 8);
+    if (std::isnan(expected)) {
+      EXPECT_TRUE(std::isnan(out_f64[i])) << mlir_type << " f64 idx=" << i;
+      if (check_nan_sign) {
+        EXPECT_EQ(actual_bits >> 63, expected_bits >> 63)
+            << mlir_type << " f64 NaN sign idx=" << i;
+      } else {
+        EXPECT_EQ(actual_bits, 0x7FF8000000000000ULL)
+            << mlir_type << " FNUZ f64 qNaN idx=" << i;
+      }
+    } else {
+      EXPECT_EQ(actual_bits, expected_bits) << mlir_type << " f64 idx=" << i;
+    }
+  }
+
+  // 5. Exhaustive bf16 -> f8 (all 65,536 bit patterns).
+  std::vector<uint16_t> all_u16(65536);
+  for (int i = 0; i < 65536; ++i) {
+    all_u16[i] = static_cast<uint16_t>(i);
+  }
+  std::vector<uint8_t> out_f8_from_bf16(65536);
+  ABSL_RETURN_IF_ERROR(compile_and_run(
+      make_convert_mlir("bf16_trunc_fp8", "truncf", "bf16", mlir_type, 65536),
+      "bf16_trunc_fp8", all_u16.data(), all_u16.size() * 2,
+      out_f8_from_bf16.data(), out_f8_from_bf16.size()));
+  for (int i = 0; i < 65536; ++i) {
+    bfloat16 bf;
+    std::memcpy(&bf, &all_u16[i], 2);
+    F8 expected = static_cast<F8>(static_cast<float>(bf));
+    uint8_t expected_bits = 0;
+    std::memcpy(&expected_bits, &expected, 1);
+    EXPECT_EQ(out_f8_from_bf16[i], expected_bits)
+        << mlir_type << " bf16->f8 idx=" << i;
+  }
+
+  // 6. Exhaustive f16 -> f8 (all 65,536 bit patterns).
+  std::vector<uint8_t> out_f8_from_f16(65536);
+  ABSL_RETURN_IF_ERROR(compile_and_run(
+      make_convert_mlir("f16_trunc_fp8", "truncf", "f16", mlir_type, 65536),
+      "f16_trunc_fp8", all_u16.data(), all_u16.size() * 2,
+      out_f8_from_f16.data(), out_f8_from_f16.size()));
+  for (int i = 0; i < 65536; ++i) {
+    half h;
+    std::memcpy(&h, &all_u16[i], 2);
+    F8 expected = static_cast<F8>(static_cast<float>(h));
+    uint8_t expected_bits = 0;
+    std::memcpy(&expected_bits, &expected, 1);
+    EXPECT_EQ(out_f8_from_f16[i], expected_bits)
+        << mlir_type << " f16->f8 idx=" << i;
+  }
+
+  // 7. Dense & boundary f32 -> f8.
+  std::vector<uint8_t> out_f8(n_f32);
+  ABSL_RETURN_IF_ERROR(compile_and_run(
+      make_convert_mlir("f32_trunc_fp8", "truncf", "f32", mlir_type, n_f32),
+      "f32_trunc_fp8", f32_bits.data(), n_f32 * 4, out_f8.data(), n_f32));
+  for (size_t i = 0; i < n_f32; ++i) {
+    float f = 0.0f;
+    std::memcpy(&f, &f32_bits[i], 4);
+    F8 expected = static_cast<F8>(f);
+    uint8_t expected_bits = 0;
+    std::memcpy(&expected_bits, &expected, 1);
+    EXPECT_EQ(out_f8[i], expected_bits)
+        << mlir_type << " f32->f8 bits=0x" << std::hex << f32_bits[i];
+  }
+  return absl::OkStatus();
+}
+
+TEST_F(CpuFusionEmitterTest, Fp8ConversionsMatchReference) {
+  llvm::FastMathFlags default_fmf;
+  ASSERT_OK(
+      VerifyFp8ConversionsInJit<tsl::float8_e4m3fn>("f8E4M3FN", default_fmf));
+  ASSERT_OK(VerifyFp8ConversionsInJit<tsl::float8_e5m2>("f8E5M2", default_fmf));
+  ASSERT_OK(VerifyFp8ConversionsInJit<tsl::float8_e4m3>("f8E4M3", default_fmf));
+  ASSERT_OK(VerifyFp8ConversionsInJit<tsl::float8_e3m4>("f8E3M4", default_fmf));
+  ASSERT_OK(VerifyFp8ConversionsInJit<tsl::float8_e4m3fnuz>(
+      "f8E4M3FNUZ", default_fmf, /*check_nan_sign=*/false));
+  ASSERT_OK(VerifyFp8ConversionsInJit<tsl::float8_e5m2fnuz>(
+      "f8E5M2FNUZ", default_fmf, /*check_nan_sign=*/false));
+  ASSERT_OK(VerifyFp8ConversionsInJit<tsl::float8_e4m3b11fnuz>(
+      "f8E4M3B11FNUZ", default_fmf, /*check_nan_sign=*/false));
+  ASSERT_OK(
+      VerifyFp8ConversionsInJit<tsl::float8_e8m0fnu>("f8E8M0FNU", default_fmf));
+
+  // Verify fast-math flags do not corrupt subnormal rounding, Inf, or NaN.
+  llvm::FastMathFlags fast_fmf = llvm::FastMathFlags::getFast();
+  ASSERT_OK(
+      VerifyFp8ConversionsInJit<tsl::float8_e4m3fn>("f8E4M3FN", fast_fmf));
+  ASSERT_OK(VerifyFp8ConversionsInJit<tsl::float8_e5m2>("f8E5M2", fast_fmf));
 }
 
 }  // namespace
