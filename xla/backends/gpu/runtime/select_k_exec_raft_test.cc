@@ -97,6 +97,12 @@ struct MaskFor<uint64_t> {
   static constexpr type kStartBits = 1000;  // uint64_t: arbitrary point
 };
 
+template <>
+struct MaskFor<uint32_t> {
+  using type = uint32_t;
+  static constexpr type kStartBits = 1000;  // uint32_t: arbitrary point
+};
+
 // Fills vector with unique values using bit patterns starting from kStartBits
 template <typename T>
 void append_unique_numbers(size_t count, std::vector<T>& arr) {
@@ -184,6 +190,8 @@ TEST(RaftSelectKExecTest, SelectKBFloat16) {
 }
 
 TEST(RaftSelectKExecTest, SelectKUint64) { RunSelectKTest<uint64_t>(); }
+
+TEST(RaftSelectKExecTest, SelectKUint32) { RunSelectKTest<uint32_t>(); }
 
 TEST(RaftSelectKExecTest, CommandBuffer) {
   se::StreamExecutor* stream_executor = GpuExecutor();
